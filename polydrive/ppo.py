@@ -1,7 +1,7 @@
 """PPO from pixels on the real game. No human runs, no ghosts: just the track
 and the agent's own crashes.
 
-    uv run python -m polydrive.ppo --envs 6 --minutes 120
+    uv run python -m polydrive.ppo --envs 6 --browsers 2 --minutes 90
 """
 import argparse
 import csv
@@ -43,6 +43,7 @@ class Policy(nn.Module):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--envs", type=int, default=6)
+    ap.add_argument("--browsers", type=int, default=2, help="separate browser processes (GPU processes)")
     ap.add_argument("--minutes", type=float, default=120)
     ap.add_argument("--steps", type=int, default=256, help="rollout length per env")
     ap.add_argument("--run", default="runs/summer1")
@@ -65,7 +66,7 @@ def main():
     epochs, minibatch = 4, 256
     N, T = args.envs, args.steps
 
-    env = VecGame(N)
+    env = VecGame(N, browsers=args.browsers)
     obs = env.reset()
     log_path = run / "episodes.csv"
     new_log = not log_path.exists()
@@ -84,7 +85,7 @@ def main():
     t_start = time.time()
     recent = []
     while time.time() - t_start < args.minutes * 60:
-        lag = 0.0
+        t_roll = time.perf_counter()
         for t in range(T):
             o = torch.from_numpy(obs)
             with torch.no_grad():
@@ -95,9 +96,7 @@ def main():
             buf_act[t] = a.cpu()
             buf_logp[t] = dist.log_prob(a).cpu()
             buf_val[t] = v.cpu()
-            t0 = time.perf_counter()
             obs, r, d, infos = env.step(a.cpu().numpy())
-            lag = max(lag, time.perf_counter() - t0 - env.dt)
             buf_rew[t] = torch.from_numpy(r)
             buf_done[t] = torch.from_numpy(d)
             for info in infos:
@@ -114,9 +113,9 @@ def main():
                     print(f"*** new best finish {info['time']:.3f}s", flush=True)
         log.flush()
         state["env_steps"] += T * N
+        sps = T * N / (time.perf_counter() - t_roll)
 
-        # Freeze physics while learning so cars don't drive on stale keys.
-        env.pause(True)
+        # Game time is virtual, so nothing moves while we learn.
         with torch.no_grad():
             _, last_v = net(torch.from_numpy(obs).to(dev))
             last_v = last_v.cpu()
@@ -156,7 +155,6 @@ def main():
         state["updates"] += 1
         torch.save({"net": net.state_dict(), "opt": opt.state_dict(), "state": state}, run / "last.pt")
         (run / "state.json").write_text(json.dumps(state, indent=1))
-        env.pause(False)
 
         pg_m, vl_m, ent_m = np.mean(stats, axis=0)
         done_eps = recent[-50:]
@@ -166,7 +164,7 @@ def main():
             ends[e["end"]] = ends.get(e["end"], 0) + 1
         print(f"[{(time.time()-t_start)/60:5.1f}m] upd {state['updates']} steps {state['env_steps']} "
               f"frac(avg50) {fr:.3f} best {state['best_frac']:.3f} finish {state['best_finish']} "
-              f"ends {ends} ent {ent_m:.2f} vl {vl_m:.3f} lag {lag*1000:.0f}ms", flush=True)
+              f"ends {ends} ent {ent_m:.2f} vl {vl_m:.3f} {sps:.0f} steps/s", flush=True)
 
     env.close()
 
